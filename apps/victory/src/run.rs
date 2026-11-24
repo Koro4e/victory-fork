@@ -227,9 +227,6 @@ fn upscaler_override(image: &victory_loader::LoadedImage) {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn ffx_scale(image: &victory_loader::LoadedImage) {
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-    const LOADS: [usize; 2] = [0x28, 0x32];
-    const SLOT: usize = 0x64;
-    const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
     let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
         return;
     };
@@ -244,38 +241,53 @@ fn ffx_scale(image: &victory_loader::LoadedImage) {
         eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>[,<hex rva>]");
         return;
     };
-    if rva + SLOT + 4 > image.info().size_of_image as usize {
+    if rva + FFX_SCALE_SPAN > image.info().size_of_image as usize {
         eprintln!("VIctory: VICTORY_FFX_SCALE: title+{rva:#x} is outside the image");
         return;
     }
     let at = (image.base() + rva) as *mut u8;
-    // SAFETY: inside the mapped image (checked above), readable.
-    let code = unsafe { std::slice::from_raw_parts(at, SLOT + 4) };
-    if LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP) || code[SLOT..] != [0xCC; 4] {
+    let mut old = 0;
+    // SAFETY: the method's first bytes and its padding, inside the mapped
+    // image (checked above); no title code runs yet.
+    let patched = unsafe {
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, PAGE_EXECUTE_READWRITE, &mut old);
+        let patched = patch_ffx_scale(std::slice::from_raw_parts_mut(at, FFX_SCALE_SPAN), scale);
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, old, &mut old);
+        patched
+    };
+    if patched {
+        eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+    } else {
         eprintln!(
             "VIctory: FidelityFX scale not patched: unexpected code at title+{rva:#x} (wrong rva?)"
         );
-        return;
     }
-    let mut old = 0;
-    // SAFETY: bytes inside the method checked above and its padding; no
-    // title code runs yet.
-    unsafe {
-        let span = at.add(LOADS[0]);
-        VirtualProtect(
-            span.cast(),
-            SLOT + 4 - LOADS[0],
-            PAGE_EXECUTE_READWRITE,
-            &mut old,
-        );
-        at.add(SLOT).cast::<f32>().write_unaligned(scale);
-        for l in LOADS {
-            let disp = (SLOT - (l + 8)) as i32;
-            at.add(l + 4).cast::<i32>().write_unaligned(disp);
-        }
-        VirtualProtect(span.cast(), SLOT + 4 - LOADS[0], old, &mut old);
+}
+
+/// The bytes of the scale method `patch_ffx_scale` reads and writes.
+#[cfg(all(windows, feature = "diagnostics"))]
+const FFX_SCALE_SPAN: usize = 0x68;
+
+/// Points both scale loads of the method `code` starts with
+/// (`vmovss xmm0, [rip+d]` at +0x28 and +0x32) at `scale`, written into the
+/// method's padding at +0x64. False, with nothing written, for other code.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn patch_ffx_scale(code: &mut [u8], scale: f32) -> bool {
+    const LOADS: [usize; 2] = [0x28, 0x32];
+    const SLOT: usize = 0x64;
+    const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
+    if code.len() < FFX_SCALE_SPAN
+        || LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP)
+        || code[SLOT..SLOT + 4] != [0xCC; 4]
+    {
+        return false;
     }
-    eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+    code[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
+    for l in LOADS {
+        let disp = (SLOT - (l + 8)) as i32;
+        code[l + 4..l + 8].copy_from_slice(&disp.to_le_bytes());
+    }
+    true
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
@@ -439,6 +451,28 @@ impl LoaderLock {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn ffx_scale_points_both_loads_at_the_constant() {
+        // Synthetic code: the two loads, filler, and int3 padding.
+        let mut code = vec![0x90u8; super::FFX_SCALE_SPAN];
+        for at in [0x28, 0x32] {
+            code[at..at + 8].copy_from_slice(&[0xC5, 0xFA, 0x10, 0x05, 1, 2, 3, 4]);
+        }
+        code[0x60..].fill(0xCC);
+        assert!(super::patch_ffx_scale(&mut code, 0.5));
+        assert_eq!(code[0x64..0x68], 0.5f32.to_le_bytes());
+        // Each load's next instruction plus its displacement is the constant.
+        for at in [0x28, 0x32] {
+            let disp = i32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+            assert_eq!(at as i32 + 8 + disp, 0x64);
+        }
+        // Already patched, so no padding left: nothing is written again.
+        let before = code.clone();
+        assert!(!super::patch_ffx_scale(&mut code, 0.25));
+        assert_eq!(code, before);
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {

@@ -198,6 +198,29 @@ fn note(call: &str, kind: u64) {
     }
 }
 
+/// The upscale description in a chain that also holds the console backend
+/// description, the one this module stands in for.
+///
+/// # Safety
+///
+/// `h` is null or the start of a chain of valid descriptions.
+unsafe fn upscale_in(mut h: *const Header) -> Option<CreateUpscale> {
+    let (mut upscale, mut backend) = (None, false);
+    while !h.is_null() {
+        // SAFETY: the caller's chain.
+        let kind = unsafe { (*h).kind };
+        match kind {
+            // SAFETY: a description of this type.
+            CREATE_UPSCALE => upscale = Some(unsafe { *h.cast::<CreateUpscale>() }),
+            CONSOLE_BACKEND => backend = true,
+            _ => note("ffxCreateContext", kind),
+        }
+        // SAFETY: as above.
+        h = unsafe { (*h).next };
+    }
+    upscale.filter(|_| backend)
+}
+
 pub extern "C" fn ffxCreateContext(
     context: *mut *mut c_void,
     desc: *mut Header,
@@ -209,22 +232,8 @@ pub extern "C" fn ffxCreateContext(
     if context.is_null() || desc.is_null() {
         return ERROR_PARAMETER;
     }
-    let mut upscale = None;
-    let mut backend = false;
-    let mut h = desc;
-    while !h.is_null() {
-        // SAFETY: the title's chain of descriptions.
-        let kind = unsafe { (*h).kind };
-        match kind {
-            // SAFETY: a description of this type.
-            CREATE_UPSCALE => upscale = Some(unsafe { *h.cast::<CreateUpscale>() }),
-            CONSOLE_BACKEND => backend = true,
-            _ => note("ffxCreateContext", kind),
-        }
-        // SAFETY: as above.
-        h = unsafe { (*h).next };
-    }
-    let (Some(mut upscale), true) = (upscale, backend) else {
+    // SAFETY: the title's chain of descriptions.
+    let Some(mut upscale) = (unsafe { upscale_in(desc) }) else {
         return ERROR_PARAMETER;
     };
     // The console's version and provider descriptions name console builds;
@@ -438,4 +447,45 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, "ffx: first upscale recorded on the host GPU");
     });
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_takes_the_upscale_description_only_beside_the_console_backend() {
+        let mut backend = Header {
+            kind: CONSOLE_BACKEND,
+            next: std::ptr::null_mut(),
+        };
+        let backend = &raw mut backend;
+        // The version description the title chains in between.
+        let mut version = Header {
+            kind: 0x1_000b,
+            next: backend,
+        };
+        let upscale = CreateUpscale {
+            kind: CREATE_UPSCALE,
+            next: &raw mut version,
+            flags: 41,
+            max_render: [2560, 1440],
+            max_upscale: [3840, 2160],
+            message: std::ptr::null(),
+        };
+        let chain = (&raw const upscale).cast::<Header>();
+        // SAFETY: a chain of our own descriptions, alive for the calls.
+        let found = unsafe { upscale_in(chain) }.expect("the upscale description");
+        assert_eq!(
+            (found.flags, found.max_render, found.max_upscale),
+            (41, [2560, 1440], [3840, 2160])
+        );
+        // A PC backend is someone else's chain: not ours to answer.
+        // SAFETY: our own description, still alive.
+        unsafe { (*backend).kind = BACKEND_DX12 };
+        // SAFETY: as above.
+        assert!(unsafe { upscale_in(chain) }.is_none());
+        // SAFETY: an empty chain.
+        assert!(unsafe { upscale_in(std::ptr::null()) }.is_none());
+    }
 }
