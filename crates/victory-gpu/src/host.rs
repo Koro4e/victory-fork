@@ -5888,6 +5888,21 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let largest = crate::draw::LARGEST_TARGET.swap(0, Ordering::Relaxed);
+        let [tw, th] = [((largest >> 32) as u32), (largest as u32)];
+        let mut sizes = crate::draw::TARGET_SIZES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        let mut sizes: Vec<(u64, u64)> = sizes.drain().collect();
+        sizes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let sizes = sizes
+            .iter()
+            .take(3)
+            .map(|(k, n)| format!("{}x{} x{n}", k >> 32, *k as u32))
+            .collect::<Vec<_>>()
+            .join(", ");
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5974,10 +5989,14 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame \
                  ({replay_same:.0} of them a repeat of the state before, {replay_diff:.0} with another state), \
                  {re_uploads:.0} re-uploads on the second queue, dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms; largest target {tw}x{th} ({sizes}) scaled {tscaled};                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+                tw = tw,
+                th = th,
+                tscaled = crate::resource::TARGET_SCALED.swap(0, std::sync::atomic::Ordering::Relaxed),
+                sizes = sizes,
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
                 picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),

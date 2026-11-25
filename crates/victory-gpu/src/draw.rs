@@ -438,6 +438,67 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// The largest render target the title drew into since the last frame
+/// line, width in the high half and height in the low: the pixels the
+/// card fills are what the render wall is made of (the present buffer is
+/// not the whole truth, the title may render smaller inside).
+pub(crate) static LARGEST_TARGET: AtomicU64 = AtomicU64::new(0);
+
+/// The target scale the host textures were made with
+/// (`VICTORY_TARGET_SCALE`, `resource::host_texture_as`): viewports and
+/// scissors scale by it, or `None` (and the title's own are used as they
+/// are) without the switch.
+pub(crate) fn target_scale() -> Option<f32> {
+    static SCALE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VICTORY_TARGET_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|&s| s > 0.0 && s < 1.0)
+    })
+}
+
+/// The title's viewports scaled to the smaller targets.
+fn scale_viewports(viewports: &[D3D12_VIEWPORT]) -> Option<Vec<D3D12_VIEWPORT>> {
+    let scale = target_scale()?;
+    Some(
+        viewports
+            .iter()
+            .map(|v| D3D12_VIEWPORT {
+                TopLeftX: v.TopLeftX * scale,
+                TopLeftY: v.TopLeftY * scale,
+                Width: v.Width * scale,
+                Height: v.Height * scale,
+                MinDepth: v.MinDepth,
+                MaxDepth: v.MaxDepth,
+            })
+            .collect(),
+    )
+}
+
+/// The title's scissors scaled to the smaller targets.
+fn scale_scissors(rects: &[RECT]) -> Option<Vec<RECT>> {
+    let scale = target_scale()?;
+    let at = |x: i32| (f64::from(x) * scale as f64).round() as i32;
+    Some(
+        rects
+            .iter()
+            .map(|r| RECT {
+                left: at(r.left),
+                top: at(r.top),
+                right: at(r.right),
+                bottom: at(r.bottom),
+            })
+            .collect(),
+    )
+}
+/// Render target sizes seen since the last frame line, by pixel count:
+/// key `width << 32 | height`, value the number of times a draw or
+/// dispatch ran with a target of that size. The largest target alone
+/// does not tell what the title renders into: the present buffer is
+/// often bigger than the surfaces the world is drawn to.
+pub(crate) static TARGET_SIZES: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -691,6 +752,20 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            // The pixels the title asks the card to fill: the largest
+            // target's size, for the frame line. `GetDesc` is a few
+            // hundred ns, and `set_targets` runs a few times a list.
+            let d = unsafe { texture.GetDesc() };
+            LARGEST_TARGET.fetch_max(
+                (d.Width << 32) | u64::from(d.Height),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if let Ok(mut sizes) = TARGET_SIZES.lock() {
+                *sizes
+                    .get_or_insert_with(Default::default)
+                    .entry((d.Width << 32) | u64::from(d.Height))
+                    .or_insert(0) += 1;
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -724,7 +799,13 @@ impl State {
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
-        crate::draw::viewports(list, viewports);
+        // With a target scale the card's targets are smaller than the
+        // title's: the viewport maps the scene onto them, so it scales.
+        if let Some(scaled) = scale_viewports(viewports) {
+            crate::draw::viewports(list, &scaled);
+        } else {
+            crate::draw::viewports(list, viewports);
+        }
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
@@ -743,7 +824,12 @@ impl State {
             crate::draw::scissors(list, &vec![full; rects.len()]);
             return;
         }
-        crate::draw::scissors(list, rects);
+        // With a target scale the rectangles scale with the viewports.
+        if let Some(scaled) = scale_scissors(rects) {
+            crate::draw::scissors(list, &scaled);
+        } else {
+            crate::draw::scissors(list, rects);
+        }
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {

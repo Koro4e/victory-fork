@@ -41,9 +41,23 @@ use windows_sys::Win32::System::Memory::{
 
 use crate::shadow::Shadow;
 
-/// The unit guarded and copied on demand: 64 KiB, the console's page (the
-/// same unit [`crate::watch`] tracks writes by).
-const PAGE: usize = 64 << 10;
+/// The unit guarded and copied on demand. The console's page is 64 KiB,
+/// but the copy-back's cost is per fault (the handler, `VirtualProtect`,
+/// `VirtualQuery`: some 150 µs each), not per byte — run 20 copied
+/// 39-48 MB a frame in ~600 faults for 93-96 ms. A megabyte page cuts
+/// the faults sixteen-fold; the extra bytes copied are `memcpy`-cheap.
+/// (`VICTORY_DEMAND_PAGE_KB` overrides, 64..=4096.)
+static PAGE_KB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub fn page() -> usize {
+    *PAGE_KB.get_or_init(|| {
+        std::env::var("VICTORY_DEMAND_PAGE_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&kb| (64..=4096).contains(&kb))
+            .unwrap_or(1024)
+            << 10
+    })
+}
 
 /// The pages of title memory guarded now (their number in the title's
 /// address space).
@@ -81,13 +95,14 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
     }
     install();
     let start = shadow.start as usize + at;
-    let first = start.div_ceil(PAGE);
-    let end = (start + n) / PAGE; // the first page past the whole ones
+    let size = page();
+    let first = start.div_ceil(size);
+    let end = (start + n) / size; // the first page past the whole ones
     if first >= end {
         return false; // no whole page: written as before
     }
-    let head = first * PAGE - start; // the piece's bytes before the pages
-    let tail = start + n - end * PAGE; // and after them
+    let head = first * size - start; // the piece's bytes before the pages
+    let tail = start + n - end * size; // and after them
     // SAFETY: committed title memory, plain read-write; the pages of the
     // piece are guarded only after these writes are done.
     if head > 0 {
@@ -96,7 +111,7 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
     if tail > 0 {
         unsafe {
             crate::host::write_mapped(
-                (end * PAGE) as *mut u8,
+                (end * size) as *mut u8,
                 bytes.as_ptr().add(n - tail),
                 tail,
             )
@@ -105,11 +120,12 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let pending = pending.get_or_insert_with(HashSet::new);
     let mut guarded = 0;
+    let size = page();
     for page in first..end {
         if !pending.insert(page) {
             continue; // already guarded: the copy holds the newest bytes
         }
-        if !guard_page(page * PAGE) {
+        if !guard_page(page * size) {
             pending.remove(&page); // not plain read-write memory: a guard
                                    // would turn an ordinary access into a
                                    // crash nothing of ours explains
@@ -136,37 +152,38 @@ fn guard_page(at: usize) -> bool {
     let mut old = PAGE_READWRITE;
     // SAFETY: a committed page of the title's memory, whose protection the
     // write watcher changes the same way.
-    let ok = unsafe { VirtualProtect(at as *const _, PAGE, PAGE_NOACCESS, &mut old) };
+    let ok = unsafe { VirtualProtect(at as *const _, page(), PAGE_NOACCESS, &mut old) };
     ok != 0
 }
 
 /// The handler's work: the title touched a guarded page. Copies the page
 /// out of the copy that holds it and gives the access back. False: the
 /// page is none of ours.
-fn hand_back(page: usize) -> bool {
+fn hand_back(index: usize) -> bool {
     let was = {
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         pending
             .as_mut()
-            .map(|m| m.remove(&page))
+            .map(|m| m.remove(&index))
             .unwrap_or(false)
     };
     if !was {
         return false;
     }
-    let at = page * PAGE;
+    let size = page();
+    let at = index * size;
     // The copy the page's bytes are in, by the page's address. It may be
     // gone (the title freed the buffer while a page of it stood guarded):
     // then the guard comes off and the access runs as it is.
-    if let Some(shadow) = crate::shadow::find_any(at as u64, PAGE as u64) {
+    if let Some(shadow) = crate::shadow::find_any(at as u64, size as u64) {
         let in_shadow = at - shadow.start as usize;
-        if in_shadow + PAGE <= shadow.len as usize {
-            shadow.demand_back(in_shadow, PAGE);
+        if in_shadow + size <= shadow.len as usize {
+            shadow.demand_back(in_shadow, size);
         }
     }
     let mut old = 0u32;
     // SAFETY: a page we made inaccessible.
-    let ok = unsafe { VirtualProtect(at as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    let ok = unsafe { VirtualProtect(at as *const _, size, PAGE_READWRITE, &mut old) };
     let ok = ok != 0;
     if ok {
         FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -185,7 +202,7 @@ pub(crate) fn install() {
         // ExceptionInformation[0]: 0 a read, 1 a write. Both are taken: a
         // write of the title's to a page the card wrote lands on the
         // card's bytes, which is what its own write over them means.
-        if hand_back(r.ExceptionInformation[1] / PAGE) {
+        if hand_back(r.ExceptionInformation[1] / page()) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH

@@ -471,6 +471,15 @@ fn twin_texture(
     d.alignment = 0;
     d.flags = UNORDERED;
     d.format = if stencil { R8_TYPELESS } else { typeless };
+    // The twin shrinks with its depth: the copies between them keep
+    // their sizes. (The flags here are unordered only, so the target
+    // check in `scale_target_desc` would not fire on its own; the depth
+    // was scaled, so scale the twin by force.)
+    if target_scale().is_some() && d.sample_count == 1 && d.dimension == 3 && d.width > 16 && d.height > 16 {
+        let scale = target_scale().unwrap();
+        d.width = ((d.width as f32 * scale) as u64).max(16);
+        d.height = ((d.height as f32 * scale) as u32).max(16);
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2039,7 +2048,68 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
-fn host_texture(
+pub(crate) static TARGET_SCALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The fraction the title's render targets and depths are made smaller
+/// by (`VICTORY_TARGET_SCALE`, read once): `None` without the switch.
+/// Shared by the host texture and the depth twins, which must shrink
+/// together, and by the viewports and scissors (`crate::draw`).
+pub(crate) fn target_scale() -> Option<f32> {
+    static SCALE: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VICTORY_TARGET_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|&s| s > 0.0 && s < 1.0)
+    })
+}
+
+/// Halves (or scales) a target's or depth's description in place. Returns
+/// whether it was scaled. Targets and depths of one title must all shrink
+/// the same way: the copies between them keep working.
+pub(crate) fn scale_target_desc(d: &mut ResourceDesc) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    let Some(scale) = target_scale() else {
+        return false;
+    };
+    // MSAA targets scale too: left full-size while the viewports shrink,
+    // they showed the scene in a quarter of the screen, the rest black
+    // (the run 21 report). The resolve to the halved non-MSAA target then
+    // compares equal sizes, as it needs.
+    if d.flags & (TARGET | DEPTH) == 0
+        || d.dimension != 3 // TEXTURE_2D
+        || d.width <= 16
+        || d.height <= 16
+    {
+        return false;
+    }
+    d.width = ((d.width as f32 * scale) as u64).max(16);
+    d.height = ((d.height as f32 * scale) as u32).max(16);
+    TARGET_SCALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// How much a title texture's host copy is smaller than the title's own
+/// description (1.0 if it is not): the host width over the title's width.
+/// Copies between the title's textures scale their coordinates by this,
+/// and a copy between two textures scaled differently is skipped: the
+/// host cannot run it, and running it anyway poisoned a command list
+/// (`E_INVALIDARG` at `Close`, the crash of run 20).
+pub(crate) fn host_scale(this: This) -> f32 {
+    let Some(host) = host_resource(this) else {
+        return 1.0;
+    };
+    let r = resource(this);
+    if r.desc.width == 0 {
+        return 1.0;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { host.GetDesc() };
+    d.Width as f32 / r.desc.width as f32
+}
+
+pub(crate) fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
@@ -2066,6 +2136,14 @@ fn host_texture_as(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    // `VICTORY_TARGET_SCALE`: the title's render targets and depths are
+    // made smaller on the host. The title's viewports and scissors are
+    // scaled to match (`State::set_viewports` and the scissor's setter),
+    // so the card fills a fraction of the pixels while the title's math
+    // stays in its own full-size coordinates. The present needs no
+    // change: the title's present texture is a target too, and the swap
+    // chain is sized from the host copy's description.
+    scale_target_desc(&mut d);
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour

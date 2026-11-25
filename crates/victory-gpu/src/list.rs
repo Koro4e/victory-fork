@@ -869,6 +869,23 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            // A target scaled by `VICTORY_TARGET_SCALE` may not be copied
+            // whole to a texture that is not: the sizes differ and the
+            // call would be refused, which poisoned a command list (the
+            // crash of run 20). Skipped: the copy had no host meaning.
+            // SAFETY: live textures.
+            let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+            if (a.Width, a.Height) != (b.Width, b.Height) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        dst_width = a.Width, dst_height = a.Height,
+                        src_width = b.Width, src_height = b.Height,
+                        "copy resource of unlike sizes skipped (a scaled target)"
+                    );
+                });
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1007,6 +1024,48 @@ extern "system" fn copy_texture_region(
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        // Scaled targets: the title's coordinates are its own full-size
+        // texels; the host copies are smaller by `host_scale`. The two
+        // sides must scale alike, or the copy has no host meaning (and
+        // recording it anyway poisoned a command list: run 20's crash).
+        let (ds, ss) = (
+            crate::resource::host_scale(dst.resource),
+            crate::resource::host_scale(src.resource),
+        );
+        // A footprint names the title's buffer layout in its own texels;
+        // into a scaled target its extent does not fit. Such uploads go
+        // through the staging path instead (`texture::upload`).
+        if dst.kind == FOOTPRINT && ds < 0.99 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a footprint copy into a scaled target skipped (the staging path uploads it)");
+            });
+            return;
+        }
+        let alike = (ds - ss).abs() < 0.01;
+        let (x, y, z, host_box) = if alike && ds < 0.99 {
+            let at = |v: u32| (v as f32 * ds).round() as u32;
+            let box_scaled = host_box.map(|b| unsafe { *b });
+            let box_scaled = box_scaled.map(|b| {
+                D3D12_BOX {
+                    left: at(b.left),
+                    top: at(b.top),
+                    right: at(b.right),
+                    bottom: at(b.bottom),
+                    front: b.front,
+                    back: b.back,
+                }
+            });
+            (at(x), at(y), at(z), box_scaled)
+        } else if alike {
+            (x, y, z, host_box.map(|b| unsafe { *b }))
+        } else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(ds, ss, "texture copy between unlike scales skipped");
+            });
+            return;
+        };
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -1040,7 +1099,7 @@ extern "system" fn copy_texture_region(
                 y,
                 z,
                 (&raw const from).cast(),
-                host_box,
+                host_box.as_ref().map(|b| b as *const _),
             )
         };
     }
