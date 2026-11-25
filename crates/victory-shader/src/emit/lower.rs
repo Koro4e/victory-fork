@@ -393,7 +393,15 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+        // A branch the console decides for the whole wave (`s_cbranch_execz`,
+        // `vccz`, that SCC: [`Structured::wave_any`]) is one decision every
+        // lane follows: past it EXEC only guards the vector instructions,
+        // and the scalar ones (a lane mask read as data among them) every
+        // lane runs, as on the console.
+        if st.wide.contains(&d)
+            || st.wave_any.get(d).copied().flatten().is_some()
+            || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+        {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
         // blocks reachable from the lane branch that do not post-dominate it
