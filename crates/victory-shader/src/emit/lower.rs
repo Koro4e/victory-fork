@@ -822,6 +822,327 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// Whether every LDS access's address has one shared form
+/// `uniform + c * tid`: the same linear expression of the thread id in every
+/// access, a byte step `c` between console lanes that covers every access's
+/// size, and nothing the analysis cannot follow (memory, another lane's LDS
+/// word, bit operations, several uniform bases). Such accesses need no
+/// ordering between the host waves: each console lane touches only words
+/// inside its own `c`-byte run of LDS, and the host waves run disjoint runs
+/// of console lanes. The rule is deliberately narrow. Addresses built by bit
+/// operations (`tid & 31`), non-linear forms, or differing uniform bases are
+/// refused: on the console those lanes run in lockstep and need no barrier,
+/// but split into two host waves they would race, and the result would be
+/// silently wrong LDS data rather than a fault. Only a one-component (1D)
+/// thread id is accepted: with 2D/3D groups the analysis cannot check how
+/// the address steps between the lanes of one host wave.
+/// `VICTORY_WAVE_LDS_ASSUME=1` assumes the whole check passes (to try one
+/// whose addresses the analysis cannot follow; quarantine keeps a wrong
+/// guess off the title's memory).
+fn lds_lane_private(p: &crate::ir::Program) -> bool {
+    if std::env::var_os("VICTORY_WAVE_LDS_ASSUME").is_some_and(|v| v == "1") {
+        return true;
+    }
+    use crate::ir::{Reg, Value};
+    // one definition per value (SSA: at most one)
+    let mut def: HashMap<Value, &crate::ir::Inst> = HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            for &(_, v) in &inst.writes {
+                def.insert(v, inst);
+            }
+        }
+    }
+    // the thread id: the console compute stage's one entry VGPR (a 1D group)
+    let tid_inputs: Vec<Value> = p
+        .inputs
+        .iter()
+        .filter(|(r, _)| matches!(r, Reg::V(_)))
+        .map(|(_, v)| *v)
+        .collect();
+    if tid_inputs.len() != 1 {
+        return false;
+    }
+    let tid = tid_inputs[0];
+
+    /// What an address is built from: `c * tid` plus a uniform part, which is
+    /// either known constants (`k0`), one unknown-but-shared value (`u`), or
+    /// both. `Unknown` is anything else.
+    #[derive(Clone, PartialEq, Eq)]
+    enum Form {
+        Unknown,
+        Lin { c: i64, u: Option<Value>, k0: Option<i64> },
+    }
+    fn const_of(op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Literal(v) => Some(*v as i32 as i64),
+            Operand::Const(code) => match *code {
+                128..=192 => Some((*code - 128) as i64),
+                193..=208 => Some(-1 - (*code - 193) as i64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn join(a: Form, b: Form) -> Form {
+        // add two forms; a uniform part only survives if both sides agree
+        match (a, b) {
+            (Form::Lin { c: c1, u: u1, k0: k1 }, Form::Lin { c: c2, u: u2, k0: k2 }) => {
+                let u = match (u1, u2) {
+                    (None, None) => None,
+                    (Some(u), None) | (None, Some(u)) => Some(u),
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => return Form::Unknown,
+                };
+                Form::Lin {
+                    c: c1 + c2,
+                    u,
+                    k0: match (k1, k2) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        _ => None,
+                    },
+                }
+            }
+            _ => Form::Unknown,
+        }
+    }
+    fn scale(a: Form, m: i64) -> Form {
+        match a {
+            Form::Lin { c, u, k0 } => Form::Lin {
+                c: c * m,
+                u,
+                k0: k0.map(|k| k * m),
+            },
+            _ => Form::Unknown,
+        }
+    }
+    fn form(
+        v: Value,
+        tid: Value,
+        def: &HashMap<Value, &crate::ir::Inst>,
+        seen: &mut HashSet<Value>,
+    ) -> Form {
+        if !seen.insert(v) {
+            return Form::Unknown;
+        }
+        if v == tid {
+            return Form::Lin { c: 1, u: None, k0: Some(0) };
+        }
+        let Some(inst) = def.get(&v) else { return Form::Unknown };
+        let name = inst.name();
+        // the values of the register reads, minus wave-wide bookkeeping
+        let vals: Vec<Value> = inst
+            .reads
+            .iter()
+            .filter(|&(r, _)| !matches!(r, Reg::Scc | Reg::S(106..=127)))
+            .map(|&(_, v)| v)
+            .collect();
+        // the constant operands, in operand order
+        let mut consts: Vec<i64> = Vec::new();
+        match &inst.fields {
+            Fields::Sop { src, imm, .. } => {
+                for op in src {
+                    if let Some(c) = const_of(op) {
+                        consts.push(c);
+                    }
+                }
+                if let Some(imm) = imm {
+                    consts.push(*imm as i16 as i64);
+                }
+            }
+            Fields::Valu(v) => {
+                for op in &v.src {
+                    if let Some(c) = const_of(op) {
+                        consts.push(c);
+                    }
+                }
+            }
+            // a read of memory or of shared LDS: not provably of one form
+            _ => return Form::Unknown,
+        }
+        // copies, adds, subtractions, constant multiplies and constant shifts
+        // only; anything else (and/or/xor, three-source mads, lane ops) cannot
+        // keep the linear form
+        match name {
+            "s_mov_b32" | "s_mov_b64" | "v_mov_b32" => match (vals.len(), consts.len()) {
+                (1, 0) => form(vals[0], tid, def, seen),
+                (0, 1) => Form::Lin { c: 0, u: None, k0: Some(consts[0]) },
+                _ => Form::Unknown,
+            },
+            "s_add_i32" | "s_add_u32" | "v_add_u32" | "v_add_co_u32" | "v_add_nc_u32" => {
+                match (vals.len(), consts.len()) {
+                    (2, 0) => {
+                        let a = form(vals[0], tid, def, seen);
+                        let b = form(vals[1], tid, def, seen);
+                        join(a, b)
+                    }
+                    (1, 1) => {
+                        let a = form(vals[0], tid, def, seen);
+                        join(a, Form::Lin { c: 0, u: None, k0: Some(consts[0]) })
+                    }
+                    (0, 2) => Form::Lin { c: 0, u: None, k0: Some(consts[0] + consts[1]) },
+                    _ => Form::Unknown,
+                }
+            }
+            "s_sub_i32" | "s_sub_u32" | "v_sub_u32" | "v_sub_co_u32" | "v_sub_nc_u32" => {
+                match (vals.len(), consts.len()) {
+                    (2, 0) => {
+                        let a = form(vals[0], tid, def, seen);
+                        let b = form(vals[1], tid, def, seen);
+                        join(a, scale(b, -1))
+                    }
+                    (1, 1) => {
+                        let a = form(vals[0], tid, def, seen);
+                        join(a, Form::Lin { c: 0, u: None, k0: Some(-consts[0]) })
+                    }
+                    _ => Form::Unknown,
+                }
+            }
+            "s_addk_i32" => match (vals.len(), consts.len()) {
+                (1, 1) => {
+                    let a = form(vals[0], tid, def, seen);
+                    join(a, Form::Lin { c: 0, u: None, k0: Some(consts[0]) })
+                }
+                _ => Form::Unknown,
+            },
+            "s_mul_i32" | "v_mul_lo_u32" | "v_mul_lo_i32" | "v_mul_u32_u24" => {
+                match (vals.len(), consts.len()) {
+                    (2, 0) => {
+                        let a = form(vals[0], tid, def, seen);
+                        let b = form(vals[1], tid, def, seen);
+                        match (a, b) {
+                            (Form::Lin { c: 0, u: None, k0: Some(m) }, other) => scale(other, m),
+                            (other, Form::Lin { c: 0, u: None, k0: Some(m) }) => scale(other, m),
+                            _ => Form::Unknown,
+                        }
+                    }
+                    (1, 1) => {
+                        let a = form(vals[0], tid, def, seen);
+                        scale(a, consts[0])
+                    }
+                    _ => Form::Unknown,
+                }
+            }
+            "s_mulk_i32" => match (vals.len(), consts.len()) {
+                (1, 1) => {
+                    let a = form(vals[0], tid, def, seen);
+                    scale(a, consts[0])
+                }
+                _ => Form::Unknown,
+            },
+            "v_lshlrev_b32" => {
+                // (dst, shift, base): the shift must be the constant first operand
+                let Fields::Valu(v) = &inst.fields else { return Form::Unknown };
+                match (vals.len(), consts.len()) {
+                    (1, 1)
+                        if v.src.len() == 2
+                            && const_of(&v.src[0]).is_some()
+                            && consts[0] >= 0
+                            && consts[0] < 31 =>
+                    {
+                        let a = form(vals[0], tid, def, seen);
+                        scale(a, 1i64 << consts[0])
+                    }
+                    _ => Form::Unknown,
+                }
+            }
+            "v_lshl_add_u32" => {
+                // (dst, src0, src1, src2) = (src0 << src1) + src2: the shift must
+                // be the constant middle operand, the two others keep the form
+                let Fields::Valu(v) = &inst.fields else { return Form::Unknown };
+                if vals.len() == 2 && v.src.len() == 3 {
+                    if let Some(sh) = const_of(&v.src[1]) {
+                        if (0..31).contains(&sh) {
+                            let a = form(vals[0], tid, def, seen);
+                            let b = form(vals[1], tid, def, seen);
+                            return join(scale(a, 1i64 << sh), b);
+                        }
+                    }
+                }
+                Form::Unknown
+            }
+            _ => Form::Unknown,
+        }
+    }
+
+    // every non-swizzle LDS access, with its size in bytes (`None`: the
+    // analysis does not model it, e.g. the strided `_2` pairs)
+    let size_of = |name: &str| -> Option<i64> {
+        if name.contains("2_b") {
+            return None;
+        }
+        if let Some(rest) = name.strip_prefix("ds_") {
+            if let Some(b) = rest.strip_prefix("read_b") {
+                return b.parse::<i64>().ok().map(|d| d / 8);
+            }
+            if let Some(b) = rest.strip_prefix("write_b") {
+                return b.parse::<i64>().ok().map(|d| d / 8);
+            }
+            // atomics, reductions, compare-exchange: one dword
+            return Some(4);
+        }
+        None
+    };
+    let mut accesses: Vec<(i64, Option<Value>, Option<i64>, i64)> = Vec::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            let name = inst.name();
+            if !matches!(inst.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            let Fields::Ds { addr, offset0, gds, .. } = &inst.fields else { continue };
+            if *gds {
+                return false;
+            }
+            let Some(size) = size_of(name) else { return false };
+            let Some(Operand::Vector { reg, dwords }) = addr else { return false };
+            let values: Vec<Value> = inst
+                .reads
+                .iter()
+                .filter(|&(r, _)| *r == Reg::V(*reg))
+                .map(|&(_, v)| v)
+                .take(*dwords as usize)
+                .collect();
+            if values.is_empty() {
+                return false;
+            }
+            for v in values {
+                let mut seen = HashSet::new();
+                let Form::Lin { c, u, k0 } = form(v, tid, &def, &mut seen) else {
+                    return false;
+                };
+                // the instruction's own byte offset shifts the base
+                let k0 = k0.map(|k| k + *offset0 as i64);
+                if c <= 0 {
+                    return false; // pure uniform, or a negative step: shared
+                }
+                accesses.push((c, u, k0, size));
+            }
+        }
+    }
+    if accesses.is_empty() {
+        return true; // no LDS access of the modelled kind
+    }
+    let c = accesses[0].0;
+    let u = accesses[0].1;
+    if !accesses.iter().all(|(a, b, _, _)| *a == c && *b == u) {
+        return false; // the forms must be one shape
+    }
+    let max_size = accesses.iter().map(|a| a.3).max().unwrap();
+    if c < max_size {
+        return false; // a lane step narrower than an access
+    }
+    let known: Vec<Option<i64>> = accesses.iter().map(|a| a.2).collect();
+    if known.iter().any(|k| k.is_none()) {
+        // every base must be the same unknown uniform, with no constant added
+        return known.iter().all(|k| k.is_none());
+    }
+    let ks: Vec<i64> = known.iter().map(|k| k.unwrap()).collect();
+    ks.iter().max().unwrap() - ks.iter().min().unwrap() <= c
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -836,103 +1157,6 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-/// Whether every LDS access's address derives only from per-lane values
-/// (the entry VGPRs, which hold the thread's id) and uniforms and
-/// constants, never from memory or another lane's LDS word. Such accesses
-/// need no ordering between the host waves: each console lane touches only
-/// the words its own address names, and the thread relabelling gives each
-/// host wave its own console lanes' words. `VICTORY_WAVE_LDS_ASSUME=1`
-/// assumes this for every program (to try one whose addresses the analysis
-/// cannot follow; quarantine keeps a wrong guess off the title's memory).
-fn lds_lane_private(p: &crate::ir::Program) -> bool {
-    if std::env::var_os("VICTORY_WAVE_LDS_ASSUME").is_some_and(|v| v == "1") {
-        return true;
-    }
-    use crate::ir::{Reg, Value};
-    // the one instruction that writes each value (SSA: at most one)
-    let mut def: std::collections::HashMap<Value, &crate::ir::Inst> =
-        std::collections::HashMap::new();
-    for block in &p.blocks {
-        for inst in &block.insts {
-            for &(_, v) in &inst.writes {
-                def.insert(v, inst);
-            }
-        }
-    }
-    let inputs: std::collections::HashMap<Value, Reg> =
-        p.inputs.iter().cloned().map(|(r, v)| (v, r)).collect();
-    // the taint of a value: 1 per-lane, 2 uniform, 4 unknown
-    fn taint(
-        v: Value,
-        def: &std::collections::HashMap<Value, &crate::ir::Inst>,
-        inputs: &std::collections::HashMap<Value, Reg>,
-        seen: &mut std::collections::HashSet<Value>,
-    ) -> u8 {
-        if !seen.insert(v) {
-            return 4;
-        }
-        if let Some(&reg) = inputs.get(&v) {
-            return match reg {
-                Reg::V(_) => 1,
-                _ => 2,
-            };
-        }
-        let Some(inst) = def.get(&v) else { return 4 };
-        let name = inst.name();
-        // a read of memory or of shared LDS: not provably per-lane
-        if matches!(inst.fields, Fields::Buffer { .. } | Fields::Smem { .. })
-            || (matches!(inst.fields, Fields::Ds { .. })
-                && !name.starts_with("ds_swizzle")
-                && !name.contains("permute"))
-        {
-            return 4;
-        }
-        let mut t = 2u8;
-        for &(reg, sv) in &inst.reads {
-            if matches!(
-                reg,
-                Reg::Scc | Reg::S(106..=107) | Reg::S(crate::ir::EXEC..=127)
-            ) {
-                continue; // vcc/exec are wave-wide bookkeeping, not address data
-            }
-            t |= taint(sv, def, inputs, seen);
-        }
-        t
-    }
-    for block in &p.blocks {
-        for inst in &block.insts {
-            let name = inst.name();
-            if !matches!(inst.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle")
-                || name.contains("permute")
-            {
-                continue;
-            }
-            let Fields::Ds { addr, .. } = &inst.fields else { continue };
-            let Some(Operand::Vector { reg, dwords }) = addr else { return false };
-            // the values the address register holds at this instruction
-            let values: Vec<Value> = inst
-                .reads
-                .iter()
-                .filter(|&(r, _)| *r == Reg::V(*reg))
-                .map(|&(_, v)| v)
-                .take(*dwords as usize)
-                .collect();
-            if values.is_empty() {
-                return false;
-            }
-            for v in values {
-                let mut seen = std::collections::HashSet::new();
-                // per-lane: the address moves with the thread; uniform alone
-                // would name one shared word; unknown is not provable
-                if taint(v, &def, &inputs, &mut seen) & 1 == 0 {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1404,10 +1628,15 @@ impl<'a> Lower<'a> {
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 // LDS whose every access names only its own lane's words needs no
-                // ordering between the host waves: see `lds_lane_private`
-                let lds_private = s.lds_dwords > 0 && group > 32 && lds_lane_private(p);
+                // ordering between the host waves: see `lds_lane_private`. Off by
+                // default (`VICTORY_WAVE_LDS_PRIVATE=1`): the rule is sound but
+                // young, and the switch is part of the shader cache key.
+                let lds_private = s.lds_dwords > 0
+                    && group > 32
+                    && std::env::var_os("VICTORY_WAVE_LDS_PRIVATE").is_some_and(|v| v == "1")
+                    && lds_lane_private(p);
                 if lds_private {
-                    eprintln!("WAVE64-LDS-PRIVATE group={group} lds={}", s.lds_dwords);
+                    tracing::info!(group, lds = s.lds_dwords, "WAVE64-LDS-PRIVATE");
                 }
                 if !crosses && (s.lds_dwords == 0 || group <= 32 || lds_private) {
                     wave = 32;
