@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// Counters since the last line.
 pub(crate) enum C {
     Submissions,
+    /// Microseconds the submitting thread spent inside the submission
+    /// lock's own wait, before any of the work under it: the split of
+    /// `SubmitLockUs` (which includes the flights' settle and the sweep)
+    /// into what the other submitting threads actually cost each other.
+    SubmitMutexUs,
     Copies,
     CopyBytes,
     Refreshes,
@@ -1087,12 +1092,13 @@ pub(crate) fn log(frames: f64) {
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
-        "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
+        "copies per frame: {:.1} submissions ({:.1} ms of them waiting for the submission lock alone); {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
+        ms(c[C::SubmitMutexUs as usize]),
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],
