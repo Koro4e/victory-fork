@@ -25,7 +25,7 @@
 
 #![cfg(windows)]
 
-use std::collections::HashSet;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,14 +54,18 @@ pub fn page() -> usize {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&kb| (64..=4096).contains(&kb))
-            .unwrap_or(1024)
+            .unwrap_or(64)
             << 10
     })
 }
 
-/// The pages of title memory guarded now (their number in the title's
-/// address space).
-static PENDING: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// The pages of title memory guarded now: the page's index in the title's
+/// address space, then the end of what its guard covers — the page clipped
+/// to the shadow it belongs to, so a guard never reaches into a
+/// neighbour's memory (a whole page past the shadow's end guarded the
+/// neighbour's bytes too, and one fault gave the whole page back, leaving
+/// the neighbour's unfaulted part stale: blocks of wrong texture).
+static PENDING: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
 
 /// Pages guarded, and pages given on a fault, since the last frame line.
 static GUARDED: AtomicU64 = AtomicU64::new(0);
@@ -118,20 +122,35 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
         };
     }
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let pending = pending.get_or_insert_with(HashSet::new);
+    let pending = pending.get_or_insert_with(std::collections::HashMap::new);
     let mut guarded = 0;
     let size = page();
+    // The shadow's end: a guard never reaches past it into a neighbour's
+    // memory.
+    let limit = shadow.start as usize + shadow.len as usize;
     for page in first..end {
-        if !pending.insert(page) {
-            continue; // already guarded: the copy holds the newest bytes
+        let at = page * size;
+        let clipped_end = at + size;
+        let clipped_end = clipped_end.min(limit);
+        if let Some(_old) = pending.insert(page, clipped_end) {
+            // Another piece (of another shadow, most likely) holds this
+            // page. Give up the whole piece: the caller writes it eagerly,
+            // and the write's touch of the other's guard is sorted out by
+            // the fault handler, which gives the page back to it first.
+            pending.insert(page, _old);
+            guarded = 0;
+            break;
         }
-        if !guard_page(page * size) {
+        if !guard_page(at, clipped_end - at) {
             pending.remove(&page); // not plain read-write memory: a guard
                                    // would turn an ordinary access into a
                                    // crash nothing of ours explains
             continue;
         }
         guarded += 1;
+    }
+    if guarded == 0 {
+        return false;
     }
     GUARDED.fetch_add(guarded, Ordering::Relaxed);
     true
@@ -140,7 +159,7 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
 /// Makes one page of title memory inaccessible. False: it is not committed
 /// read-write memory (a reservation, another protection), so a guard would
 /// turn an ordinary access into a crash nothing of ours explains.
-fn guard_page(at: usize) -> bool {
+fn guard_page(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -152,7 +171,7 @@ fn guard_page(at: usize) -> bool {
     let mut old = PAGE_READWRITE;
     // SAFETY: a committed page of the title's memory, whose protection the
     // write watcher changes the same way.
-    let ok = unsafe { VirtualProtect(at as *const _, page(), PAGE_NOACCESS, &mut old) };
+    let ok = unsafe { VirtualProtect(at as *const _, len, PAGE_NOACCESS, &mut old) };
     ok != 0
 }
 
@@ -165,30 +184,30 @@ fn hand_back(index: usize) -> bool {
         pending
             .as_mut()
             .map(|m| m.remove(&index))
-            .unwrap_or(false)
+            .unwrap_or(None)
     };
-    if !was {
+    let Some(end) = was else {
         return false;
-    }
+    };
     let size = page();
     let at = index * size;
+    let len = end - at;
     // The copy the page's bytes are in, by the page's address. It may be
     // gone (the title freed the buffer while a page of it stood guarded):
     // then the guard comes off and the access runs as it is.
-    if let Some(shadow) = crate::shadow::find_any(at as u64, size as u64) {
-        // A page of a megabyte reaches past this shadow into a neighbour's:
-        // copy only what is ours, and let the neighbour's own faults bring
-        // its bytes. (Skipping the copy left the page's stale bytes in the
-        // title's memory, which showed as blocks of wrong texture.)
+    if let Some(shadow) = crate::shadow::find_any(at as u64, len as u64) {
+        // The guard was clipped to this shadow already; the copy takes the
+        // overlap once more, in case the guard's rounding (the protection
+        // works on 4 KiB pages) reached a neighbour's bytes.
         let in_shadow = at.saturating_sub(shadow.start as usize);
-        let end = (in_shadow + size).min(shadow.len as usize);
-        if end > in_shadow {
-            shadow.demand_back(in_shadow, end - in_shadow);
+        let stop = (in_shadow + len).min(shadow.len as usize);
+        if stop > in_shadow {
+            shadow.demand_back(in_shadow, stop - in_shadow);
         }
     }
     let mut old = 0u32;
     // SAFETY: a page we made inaccessible.
-    let ok = unsafe { VirtualProtect(at as *const _, size, PAGE_READWRITE, &mut old) };
+    let ok = unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) };
     let ok = ok != 0;
     if ok {
         FAULTS.fetch_add(1, Ordering::Relaxed);
