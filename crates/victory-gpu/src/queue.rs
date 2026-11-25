@@ -778,6 +778,9 @@ extern "system" fn present(
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
+    // The second queue's texture re-uploads run now: the main queue has
+    // settled, and the next frame is only being recorded.
+    crate::copyq::flush();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();

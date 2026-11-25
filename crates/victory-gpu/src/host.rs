@@ -38,7 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -125,19 +125,37 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
     let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
+        return scaled(NORMAL_MS);
     };
     if budget == 0 {
-        return NORMAL_MS;
+        return scaled(NORMAL_MS);
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
     if used_pct >= 85 {
-        HIGH_MS
+        scaled(HIGH_MS)
     } else if used_pct >= 75 {
-        MODERATE_MS
+        scaled(MODERATE_MS)
     } else {
-        NORMAL_MS
+        scaled(NORMAL_MS)
     }
+}
+
+/// The idle timeouts were tuned for runs at 30-60 fps, where a second is
+/// 30-60 frames. At 3 fps a second is 3 frames: textures in the view of
+/// the moment went idle and were let go, and their next use made them and
+/// their bytes again, a hundred MB and more a frame. `VICTORY_VRAM_IDLE_SCALE`
+/// stretches them: at 60 a high-pressure texture stays a minute, which at
+/// 3 fps is the view of the moment and not a wanderer of frames ago.
+fn scaled(ms: u64) -> u64 {
+    static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_IDLE_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1)
+    });
+    ms.saturating_mul(scale)
 }
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
@@ -3427,6 +3445,7 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                crate::copyq::wait_due(&self.queue);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -4103,6 +4122,7 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            crate::copyq::wait_due(&self.queue);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -4144,6 +4164,7 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            crate::copyq::wait_due(&self.queue);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -5795,6 +5816,7 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         let (replay_same, replay_diff) = crate::draw::take_replay();
         let (replay_same, replay_diff) = (replay_same as f64 / frames, replay_diff as f64 / frames);
+        let re_uploads = crate::copyq::take_flushed() as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -5951,7 +5973,7 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame \
                  ({replay_same:.0} of them a repeat of the state before, {replay_diff:.0} with another state), \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 {re_uploads:.0} re-uploads on the second queue, dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",

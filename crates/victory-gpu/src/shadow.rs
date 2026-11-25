@@ -30,8 +30,8 @@ pub(crate) struct Shadow {
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
-    start: u64,
-    len: u64,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
@@ -2438,8 +2438,7 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
-    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
-        let start = self.start as usize;
+    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {        let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
@@ -2482,8 +2481,24 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        if !crate::demand::offer(self, at, n, &title) {
+            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        }
         n
+    }
+
+    /// The card wrote, and the title reads: `n` bytes at `at` of this copy
+    /// go into title memory now (the demand back's fault handler). The
+    /// bytes are the copy's own — the newest the card wrote.
+    pub(crate) fn demand_back(&self, at: usize, n: usize) {
+        let start = self.start as usize;
+        if at + n > self.len as usize {
+            return;
+        }
+        // SAFETY: inside the copy's mapping (checked above), and the title
+        // memory it lands in is committed (it was guarded there).
+        unsafe { crate::host::write_mapped((start + at) as *mut u8, self.data.add(at), n) };
+        crate::watch::writing(start + at, n);
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3181,7 +3196,9 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        if !crate::demand::offer(self, at, n, &title) {
+            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        }
         n
     }
 }

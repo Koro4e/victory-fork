@@ -33,12 +33,12 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    pub(crate) buffer: ID3D12Resource,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
-    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    pub(crate) footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
@@ -628,6 +628,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    // A re-upload (`VICTORY_TEXTURE_QUEUE=1`): the texture already shows
+    // the last level the title streamed, so its copy may run on the second
+    // queue at the next present, out of the frame's lists. A first upload
+    // stays inline: the frame would sample a texture with nothing in it.
+    if staging.uploaded.load(Relaxed) && crate::copyq::enabled() {
+        crate::copyq::schedule(&staging, texture);
+        list.defer_texture(staging.clone());
+        let staging = staging.clone();
+        list.defer_host(move || {
+            staging.uploaded.store(true, Relaxed);
+            staging.dirty.store(false, Relaxed);
+        });
+        return;
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
