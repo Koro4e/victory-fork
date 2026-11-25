@@ -1078,7 +1078,7 @@ extern "system" fn copy_texture_region(
         {
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                let (d, b) = unsafe { (to.GetDesc(), host_box) };
                 format!(
                     "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
