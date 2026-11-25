@@ -87,8 +87,8 @@ pub(crate) struct HeapDesc {
 pub(crate) struct ResourceDesc {
     dimension: u32,
     alignment: u64,
-    width: u64,
-    height: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
     depth_or_array_size: u16,
     mip_levels: u16,
     format: u32,
@@ -835,7 +835,7 @@ pub(crate) extern "system" fn allocation_info(
 /// region (width, height, depth).
 #[repr(C)]
 pub(crate) struct ResourceDesc1 {
-    desc: ResourceDesc,
+    pub(crate) desc: ResourceDesc,
     mip_region: [u32; 3],
 }
 const _: () = assert!(size_of::<ResourceDesc1>() == 72);
@@ -1108,9 +1108,9 @@ impl Drop for Backing {
 }
 
 #[repr(C)]
-struct Resource {
+pub(crate) struct Resource {
     object: Object,
-    desc: ResourceDesc,
+    pub(crate) desc: ResourceDesc,
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
@@ -2333,7 +2333,7 @@ impl Resource {
     }
 }
 
-fn resource<'a>(this: This) -> &'a Resource {
+pub(crate) fn resource<'a>(this: This) -> &'a Resource {
     // SAFETY: called from resource methods only.
     unsafe { &*this.cast::<Resource>() }
 }

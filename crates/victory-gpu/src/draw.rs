@@ -2229,7 +2229,15 @@ impl State {
         }
         let s = crate::resource::host_scale(*r as crate::object::This);
         if s >= 1.0 {
-            self.dispatch_scale_max.set(1.0f32.to_bits());
+            // A full-size target among the scaled ones holds the groups
+            // back — unless it is a small aux texture (a histogram, a
+            // gather buffer): its writes need no full-size dispatch, and
+            // holding back a pass that writes the screen for its sake
+            // showed the scene in a quarter of it.
+            let d = crate::resource::resource(*r as crate::object::This);
+            if d.desc.width > 512 || d.desc.height > 512 {
+                self.dispatch_scale_max.set(1.0f32.to_bits());
+            }
             return;
         }
         let bits = self.dispatch_scale.get();
