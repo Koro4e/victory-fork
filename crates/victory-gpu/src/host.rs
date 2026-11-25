@@ -4591,6 +4591,10 @@ impl Host {
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
+        // Pages the demand back gave on faults since the last submission:
+        // their blocks go back under the write watch before any refresh
+        // reads them, so the copies see the bytes the title wrote there.
+        crate::watch::reprotect_given();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots

@@ -330,6 +330,60 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+/// Pages the demand back gave on a fault since the last refresh: the write
+/// watch makes their blocks read-only again there, not in the handler (a
+/// fault handler must not take the guards' lock nor make other pages
+/// read-only over a page another fault may be guarding).
+static GIVEN_BACK: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Called from `demand::hand_back` once a page's access is back. Cheap on
+/// purpose: a fault handler pushes and returns.
+pub(crate) fn given_back(at: usize, len: usize) {
+    let mut q = GIVEN_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() < 1 << 16 {
+        q.push((at, len));
+    }
+}
+
+/// Makes the blocks the demand back gave read-only again. A block a new
+/// `offer` guards meanwhile is left to it (the entry stands, and the fault
+/// that gives it back queues it again). Noted protected and NOT clean: its
+/// bytes changed under it, so the next `guard` reports it written — that is
+/// what the copies read to refresh.
+pub(crate) fn reprotect_given() {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let ranges = {
+        let mut q = GIVEN_BACK.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *q)
+    };
+    let mut g = guards();
+    for (at, len) in ranges {
+        let first = at / BLOCK;
+        let last = at.saturating_add(len).div_ceil(BLOCK);
+        for block in first..last {
+            if g.protected.contains(&block) {
+                continue;
+            }
+            // Lock order: GUARDS then PENDING, as `open_here` does.
+            if crate::demand::standing(block * BLOCK).is_some() {
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            let ok = unsafe {
+                VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old)
+            };
+            if ok != 0 {
+                g.protected.insert(block);
+                g.clean.remove(&block);
+            }
+        }
+    }
+}
+
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;

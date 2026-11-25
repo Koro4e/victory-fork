@@ -314,6 +314,9 @@ fn hand_back(index: usize) -> bool {
     let ok = ok != 0;
     if ok {
         FAULTS.fetch_add(1, Ordering::Relaxed);
+        // The write watch re-arms its blocks on the next refresh (a fault
+        // handler must not take the guards' lock nor touch other pages).
+        crate::watch::given_back(at, len);
         // The entry goes only now: a fault that came in while the page was
         // still NOACCESS found the entry and did the same work again.
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
