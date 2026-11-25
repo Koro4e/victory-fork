@@ -65,7 +65,13 @@ pub fn page() -> usize {
 /// neighbour's memory (a whole page past the shadow's end guarded the
 /// neighbour's bytes too, and one fault gave the whole page back, leaving
 /// the neighbour's unfaulted part stale: blocks of wrong texture).
-static PENDING: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+// The entry also carries a generation: a handler that peeked the entry
+    // removes it only while the generation is its own, so a second entry a
+    // relay thread put on the page in between survives the first handler's
+    // cleanup (two handlers on one page used to be able to delete each
+    // other's entry and leave the page NOACCESS with no entry: the crash
+    // the peek below fixed, once more).
+static PENDING: Mutex<Option<std::collections::HashMap<usize, (usize, u64)>>> = Mutex::new(None);
 
 /// Pages guarded, and pages given on a fault, since the last frame line.
 static GUARDED: AtomicU64 = AtomicU64::new(0);
@@ -125,6 +131,7 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
     let pending = pending.get_or_insert_with(std::collections::HashMap::new);
     let mut guarded = 0;
     let size = page();
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
     // The shadow's end: a guard never reaches past it into a neighbour's
     // memory.
     let limit = shadow.start as usize + shadow.len as usize;
@@ -132,7 +139,8 @@ pub(crate) fn offer(shadow: &Shadow, at: usize, n: usize, bytes: &[u8]) -> bool 
         let at = page * size;
         let clipped_end = at + size;
         let clipped_end = clipped_end.min(limit);
-        if let Some(_old) = pending.insert(page, clipped_end) {
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        if let Some(_old) = pending.insert(page, (clipped_end, generation)) {
             // Another piece (of another shadow, most likely) holds this
             // page. Give up the whole piece: the caller writes it eagerly,
             // and the write's touch of the other's guard is sorted out by
@@ -189,7 +197,7 @@ fn hand_back(index: usize) -> bool {
         let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         pending.as_ref().and_then(|m| m.get(&index).copied())
     };
-    let Some(end) = was else {
+    let Some((end, generation)) = was else {
         // A fault on a page with no pending entry: an ordinary access
         // violation of the title's (the handler sees them all) — unless
         // the page is still NOACCESS, which would be a page our guard
@@ -198,7 +206,11 @@ fn hand_back(index: usize) -> bool {
         #[cfg(feature = "diagnostics")]
         unsafe {
             let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            let at = index * page();
+            let at = index.checked_mul(page());
+            let at = match at {
+                Some(at) => at,
+                None => return false,
+            };
             let n = VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>());
             if n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS {
                 tracing::warn!(index, "a fault on a page left NOACCESS with no demand entry");
@@ -232,7 +244,11 @@ fn hand_back(index: usize) -> bool {
         // still NOACCESS found the entry and did the same work again.
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = pending.as_mut() {
-            m.remove(&index);
+            // Only our own generation: an entry a relay thread put on the
+            // page in between stays, and the page stays guarded for it.
+            if m.get(&index).is_some_and(|&(_, g)| g == generation) {
+                m.remove(&index);
+            }
         }
     }
     ok
