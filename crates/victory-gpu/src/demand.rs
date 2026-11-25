@@ -176,9 +176,14 @@ fn hand_back(index: usize) -> bool {
     // gone (the title freed the buffer while a page of it stood guarded):
     // then the guard comes off and the access runs as it is.
     if let Some(shadow) = crate::shadow::find_any(at as u64, size as u64) {
-        let in_shadow = at - shadow.start as usize;
-        if in_shadow + size <= shadow.len as usize {
-            shadow.demand_back(in_shadow, size);
+        // A page of a megabyte reaches past this shadow into a neighbour's:
+        // copy only what is ours, and let the neighbour's own faults bring
+        // its bytes. (Skipping the copy left the page's stale bytes in the
+        // title's memory, which showed as blocks of wrong texture.)
+        let in_shadow = at.saturating_sub(shadow.start as usize);
+        let end = (in_shadow + size).min(shadow.len as usize);
+        if end > in_shadow {
+            shadow.demand_back(in_shadow, end - in_shadow);
         }
     }
     let mut old = 0u32;

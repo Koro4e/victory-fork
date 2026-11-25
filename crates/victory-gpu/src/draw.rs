@@ -240,6 +240,13 @@ pub(crate) struct State {
     /// The state key of the last draw or dispatch that ran in this list
     /// (slice 1 of `VICTORY_FRAME_REPLAY`: 0 until the first one).
     last_key: u64,
+    /// The scale of the scaled UAV textures the list's tables hold: the
+    /// smallest seen since the last draw or dispatch (0: none). A dispatch
+    /// writing through a scaled target asks for the title's full-size
+    /// groups; the host texture is smaller by this, so its groups shrink
+    /// to match ([`State::dispatch`]). Reset by every draw, so a stale
+    /// scale cannot reach a dispatch whose targets are full-size.
+    dispatch_scale: std::cell::Cell<u32>,
 }
 
 impl Drop for State {
@@ -2190,6 +2197,29 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// Notes a bound UAV texture's scale ([`State::dispatch_scale`]): the
+    /// smallest (the most scaled) of what the dispatch's tables hold.
+    fn note_scaled_uav(&self, kind: ResourceType, view: &View) {
+        if kind != ResourceType::Uav {
+            return;
+        }
+        let crate::descriptor::View::Unordered(r, _, _) = view else {
+            return;
+        };
+        if *r == 0 {
+            return;
+        }
+        let s = crate::resource::host_scale(*r as crate::object::This);
+        if s >= 1.0 {
+            return;
+        }
+        let bits = self.dispatch_scale.get();
+        let old = if bits == 0 { 1.0 } else { f32::from_bits(bits) };
+        if s < old {
+            self.dispatch_scale.set(s.to_bits());
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
@@ -2244,6 +2274,21 @@ impl State {
             REPLAY_DIFF.fetch_add(1, Ordering::Relaxed);
         }
         self.last_key = key;
+        // A dispatch whose tables hold a scaled target wrote the title's
+        // full-size groups: the host texture is smaller, so its groups
+        // shrink to match, and the shader's thread coordinates land in it
+        // ([`State::dispatch_scale`]). The scale resets: the next dispatch
+        // measures its own targets.
+        let bits = self.dispatch_scale.replace(0);
+        let (x, y) = if bits != 0 {
+            let s = f32::from_bits(bits);
+            (
+                ((x as f32) * s).ceil().max(1.0) as u32,
+                ((y as f32) * s).ceil().max(1.0) as u32,
+            )
+        } else {
+            (x, y)
+        };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2618,6 +2663,7 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
+            self.note_scaled_uav(u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2743,6 +2789,7 @@ impl State {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        self.note_scaled_uav(u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -2754,6 +2801,7 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                        self.note_scaled_uav(kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2792,6 +2840,7 @@ impl State {
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                            self.note_scaled_uav(kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -2895,6 +2944,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.dispatch_scale.set(0);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3009,6 +3059,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.dispatch_scale.set(0);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
