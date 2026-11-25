@@ -674,6 +674,12 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
+    // A block of a page the demand back holds is already inaccessible and
+    // belongs to it: made read-only, its fault would be ours and the entry
+    // would stand over a page nobody guards again.
+    if crate::demand::standing(block * BLOCK).is_some() {
+        return;
+    }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -700,11 +706,27 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    if set(from, to) {
-        note(g, from, to);
-        return;
+    // A block of a page the demand back holds is already inaccessible and
+    // belongs to it: made read-only, its fault would be ours and the entry
+    // would stand over a page nobody guards again. Such blocks are skipped
+    // one by one; they come back read-only at the next protect of the
+    // range (counted, to see whether that ever matters).
+    let held: Vec<usize> = (from..to)
+        .filter(|&b| crate::demand::standing(b * BLOCK).is_some())
+        .collect();
+    if held.is_empty() {
+        if set(from, to) {
+            note(g, from, to);
+            return;
+        }
+    } else {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DemandHeldBlocks, held.len() as u64);
     }
     for block in from..to {
+        if held.binary_search(&block).is_ok() {
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
@@ -764,9 +786,20 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // The page may have been the demand back's (an entry standing over
+        // it from before our protect was skipped): its access comes back
+        // with ours, and its entry goes with it.
+        let generation = crate::demand::standing(block * BLOCK);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        let ok = unsafe {
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+        } != 0;
+        if ok {
+            if let Some(generation) = generation {
+                crate::demand::yielded(block * BLOCK, generation);
+            }
+        }
     }
     !blocks.is_empty()
 }
@@ -777,6 +810,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
+    // A demand page under the write would refuse the kernel's bytes and
+    // keep its entry: given back first, with its entry dropped with it.
+    crate::demand::opening(at, len);
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);

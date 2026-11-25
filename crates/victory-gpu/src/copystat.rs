@@ -15,6 +15,9 @@ pub(crate) enum C {
     /// `SubmitLockUs` (which includes the flights' settle and the sweep)
     /// into what the other submitting threads actually cost each other.
     SubmitMutexUs,
+    /// Write-watch blocks skipped in a protect because a demand page held
+    /// them: they come back read-only at the next protect of the range.
+    DemandHeldBlocks,
     Copies,
     CopyBytes,
     Refreshes,
@@ -1099,6 +1102,7 @@ pub(crate) fn log(frames: f64) {
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         ms(c[C::SubmitMutexUs as usize]),
+        crate::demand::take_given() as f64 / frames,
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],

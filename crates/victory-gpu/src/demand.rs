@@ -92,6 +92,80 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DEMAND_BACK").is_some_and(|v| v == "1"))
 }
 
+/// The generation of the entry standing on the page that holds `at`, if
+/// any. Asked by the write watch before it makes a block read-only: a
+/// demand page is already inaccessible and belongs to [`offer`], and a
+/// READONLY over it turns its fault into the write watch's, leaving the
+/// entry standing over a page nobody guards again (`offer` skips a page
+/// it finds in `PENDING`).
+pub(crate) fn standing(at: usize) -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
+    let page = at / page();
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending.as_ref()?.get(&page).map(|&(_, generation)| generation)
+}
+
+/// The entry `generation` of the page that holds `at` goes: the page's
+/// access was given back without a fault (`watch::open_here`, or an
+/// explicit write through the kernel, [`opening`]). Removed only while it
+/// is still that entry, so a page `offer` guarded again meanwhile keeps
+/// its own.
+pub(crate) fn yielded(at: usize, generation: u64) {
+    let page = at / page();
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = pending.as_mut() {
+        if map.get(&page).is_some_and(|&(_, g)| g == generation) {
+            map.remove(&page);
+        }
+    }
+}
+
+/// An explicit write of `len` bytes at `at` that does not fault (ours
+/// through the kernel, or the title's `fread`): every page of ours under
+/// it is given back and its entry dropped with it. Without this the write
+/// lands on a NOACCESS page, the kernel refuses it and the bytes are
+/// lost, while the entry stands over a page nobody guards.
+pub(crate) fn opening(at: usize, len: usize) {
+    if !enabled() || len == 0 {
+        return;
+    }
+    let size = page();
+    let first = at / size;
+    let last = at.saturating_add(len).saturating_sub(1) / size;
+    let mut given: Vec<(usize, usize, u64)> = Vec::new();
+    {
+        let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = pending.as_ref() else { return };
+        for page in first..=last {
+            if let Some(&(end, generation)) = map.get(&page) {
+                given.push((page, end, generation));
+            }
+        }
+    }
+    for (page, end, generation) in given {
+        let base = page * size;
+        let mut old = 0;
+        // SAFETY: the page `offer` guarded, with exactly the length it did.
+        let ok = unsafe {
+            VirtualProtect(base as *const _, end.saturating_sub(base), PAGE_READWRITE, &mut old)
+        };
+        if ok != 0 {
+            yielded(base, generation);
+            GIVEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Pages given back by [`opening`], since the last frame line.
+static GIVEN: AtomicU64 = AtomicU64::new(0);
+
+/// Pages [`opening`] gave back, into the frame line.
+pub(crate) fn take_given() -> u64 {
+    GIVEN.swap(0, Ordering::Relaxed)
+}
+
 /// The card wrote `n` bytes at `at` of `shadow`'s copy, and the eager path
 /// would write them into title memory now (`bytes` are what it would
 /// write). Takes the whole pages of the piece ([`enabled`]): they are
