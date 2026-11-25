@@ -111,6 +111,11 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    #[cfg(all(windows, not(feature = "diagnostics")))]
+    {
+        upscaler_override(&image);
+        ffx_scale(&image);
+    }
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
