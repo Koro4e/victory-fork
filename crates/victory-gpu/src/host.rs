@@ -812,6 +812,13 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// With `VICTORY_INDIRECT_JOIN=1`: the single-record indirect executions
+    /// that walk one argument buffer by one step, held back until the walk
+    /// breaks, then issued as one call with the count of the records it
+    /// holds. The title issues its mesh draws one record per call (3,460 a
+    /// frame), and D3D12 runs a call with `MaxCommandCount` over the same
+    /// records in order, so one call covers the walk.
+    join: Mutex<Option<Join>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -822,6 +829,24 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// A held-back run of single-record indirect executions (`HostList::join`):
+/// the scratch buffer they read, the byte offset of the first, how many
+/// are held, and the kind and stride of the signature that runs them.
+pub(crate) struct Join {
+    bounded: ID3D12Resource,
+    at: u64,
+    records: u32,
+    kind: u32,
+    stride: u32,
+}
+
+/// Whether the single-record indirect executions are held back and issued
+/// as one call over the walk (`VICTORY_INDIRECT_JOIN=1`).
+pub(crate) fn join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INDIRECT_JOIN").as_deref() == Ok("1"))
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3240,6 +3265,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                join: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5119,7 +5145,73 @@ impl HostList {
         times
     }
 
+    /// Holds back one more single-record indirect execution of the run
+    /// (`indirect`'s walk), or issues the held ones and starts a new run
+    /// when this record does not continue it: the same scratch buffer and
+    /// the record right after the last held one. The scratch buffer is
+    /// returned to the common state with the issued call (`indirect::done`).
+    pub(crate) fn join_hold(&self, kind: u32, stride: u32, bounded: &ID3D12Resource, at: u64) {
+        let mut join = self.join.lock().unwrap_or_else(|e| e.into_inner());
+        let continues = match join.as_ref() {
+            Some(held) => {
+                held.kind == kind
+                    && held.stride == stride
+                    && held.bounded.as_raw() == bounded.as_raw()
+                    && held.at + u64::from(held.stride) == at
+            }
+            None => false,
+        };
+        if continues {
+            let held = join.as_mut().unwrap();
+            held.records += 1;
+            return;
+        }
+        if let Some(held) = join.take() {
+            self.join_issue(held);
+        }
+        *join = Some(Join {
+            bounded: bounded.clone(),
+            at,
+            records: 1,
+            kind,
+            stride,
+        });
+    }
+
+    /// Issues the held indirect executions as one call, and drops the run.
+    pub(crate) fn join_flush(&self) {
+        let held = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(held) = held {
+            self.join_issue(held);
+        }
+    }
+
+    /// Records one call over the held records, then returns their scratch
+    /// buffer to the common state. The signature is the one per-record calls
+    /// use (`draw.rs`'s `host_signature`), cached by kind and stride.
+    fn join_issue(&self, held: Join) {
+        let Some(signature) = crate::draw::host_signature(held.kind, held.stride) else {
+            return;
+        };
+        // SAFETY: an open list, a live scratch buffer in INDIRECT_ARGUMENT
+        // (its states are the per-record calls': the clamp put it there and
+        // `done` takes it back below).
+        unsafe {
+            self.list.ExecuteIndirect(
+                &signature,
+                held.records,
+                &held.bounded,
+                held.at,
+                None,
+                0,
+            )
+        };
+        crate::draw::JOINED.fetch_add(u64::from(held.records) - 1, std::sync::atomic::Ordering::Relaxed);
+        crate::indirect::done(self, &held.bounded);
+    }
+
     pub(crate) fn close(&self) {
+        self.join_flush();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {

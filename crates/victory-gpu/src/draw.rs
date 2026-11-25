@@ -356,6 +356,11 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Indirect executions the joined calls saved since the last frame line
+/// (`VICTORY_INDIRECT_JOIN=1`): records that ran inside a held call instead
+/// of one of their own.
+pub(crate) static JOINED: AtomicU64 = AtomicU64::new(0);
+
 /// Draws and dispatches that ran with the exact state of the one before
 /// them in their list (`VICTORY_FRAME_REPLAY`'s slice 1: how much of a
 /// frame is repeats a replay buffer would not have to re-state).
@@ -3372,7 +3377,7 @@ impl State {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
