@@ -237,6 +237,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The state key of the last draw or dispatch that ran in this list
+    /// (slice 1 of `VICTORY_FRAME_REPLAY`: 0 until the first one).
+    last_key: u64,
 }
 
 impl Drop for State {
@@ -327,6 +330,78 @@ fn mesh_kept(pipeline: usize) -> bool {
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Draws and dispatches that ran with the exact state of the one before
+/// them in their list (`VICTORY_FRAME_REPLAY`'s slice 1: how much of a
+/// frame is repeats a replay buffer would not have to re-state).
+static REPLAY_SAME: AtomicU64 = AtomicU64::new(0);
+
+/// Draws and dispatches that ran with another state than the one before
+/// them: each needs its state block in a replay buffer.
+static REPLAY_DIFF: AtomicU64 = AtomicU64::new(0);
+
+/// The replay counts since the last call: (same state, another state).
+pub(crate) fn take_replay() -> (u64, u64) {
+    (
+        REPLAY_SAME.swap(0, Ordering::Relaxed),
+        REPLAY_DIFF.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// A cheap fingerprint of everything a draw's state is: the pipeline, the
+/// heaps, the root arguments, the vertex and index views, the topology and
+/// the depth state, the render targets. Draws of the same list with the
+/// same key repeat one another byte for byte.
+fn state_key(state: &State) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(&mut h, &state.pipeline.to_le_bytes());
+    feed(&mut h, &state.heaps[0].to_le_bytes());
+    feed(&mut h, &state.heaps[1].to_le_bytes());
+    for roots in [&state.graphics, &state.compute] {
+        for root in roots.iter() {
+            match root {
+                Root::None => feed(&mut h, &[0]),
+                Root::Table(a) => {
+                    feed(&mut h, &[1]);
+                    feed(&mut h, &a.to_le_bytes());
+                }
+                Root::Constants(c) => {
+                    feed(&mut h, &[2]);
+                    feed(&mut h, &(c.len() as u64).to_le_bytes());
+                    for v in c {
+                        feed(&mut h, &v.to_le_bytes());
+                    }
+                }
+                Root::View(a) => {
+                    feed(&mut h, &[3]);
+                    feed(&mut h, &a.to_le_bytes());
+                }
+            }
+        }
+        feed(&mut h, &[4]);
+    }
+    for v in &state.vertex {
+        feed(&mut h, &v.address.to_le_bytes());
+        feed(&mut h, &v.size.to_le_bytes());
+        feed(&mut h, &v.stride.to_le_bytes());
+    }
+    feed(&mut h, &state.index.address.to_le_bytes());
+    feed(&mut h, &state.index.size.to_le_bytes());
+    feed(&mut h, &state.index.format.to_le_bytes());
+    feed(&mut h, &state.topology.to_le_bytes());
+    feed(&mut h, &state.depth_state.to_le_bytes());
+    for t in &state.target_handles {
+        feed(&mut h, &t.to_le_bytes());
+    }
+    feed(&mut h, &state.depth_handle.to_le_bytes());
+    h
+}
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
@@ -2069,6 +2144,13 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        let key = state_key(self);
+        if self.last_key != 0 && key == self.last_key {
+            REPLAY_SAME.fetch_add(1, Ordering::Relaxed);
+        } else {
+            REPLAY_DIFF.fetch_add(1, Ordering::Relaxed);
+        }
+        self.last_key = key;
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2723,6 +2805,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
+        if ready {
+            let key = state_key(self);
+            if self.last_key != 0 && key == self.last_key {
+                REPLAY_SAME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                REPLAY_DIFF.fetch_add(1, Ordering::Relaxed);
+            }
+            self.last_key = key;
+        }
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
@@ -2835,6 +2926,13 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
+            let key = state_key(self);
+            if self.last_key != 0 && key == self.last_key {
+                REPLAY_SAME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                REPLAY_DIFF.fetch_add(1, Ordering::Relaxed);
+            }
+            self.last_key = key;
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
