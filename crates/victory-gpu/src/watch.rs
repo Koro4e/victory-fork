@@ -760,33 +760,50 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    // A block of a page the demand back holds is already inaccessible and
-    // belongs to it: made read-only, its fault would be ours and the entry
-    // would stand over a page nobody guards again. Such blocks are skipped
-    // one by one; they come back read-only at the next protect of the
-    // range (counted, to see whether that ever matters).
-    let held: Vec<usize> = (from..to)
-        .filter(|&b| crate::demand::standing(b * BLOCK).is_some())
-        .collect();
-    if held.is_empty() {
+    // One range, or block by block when the bulk protect fails (memory
+    // that is not committed).
+    let protect_range = |g: &mut Guards, from: usize, to: usize| {
         if set(from, to) {
             note(g, from, to);
             return;
         }
-    } else {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DemandHeldBlocks, held.len() as u64);
-    }
-    for block in from..to {
-        if held.binary_search(&block).is_ok() {
-            continue;
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
         }
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
-        }
+    };
+    // A block of a page the demand back holds is already inaccessible and
+    // belongs to it: made read-only, its fault would be ours and the entry
+    // would stand over a page nobody guards again. The held pages are cut
+    // out as whole-page gaps and the stretches between them are protected
+    // in bulk: a call per stretch, not per block (with large demand pages
+    // nearly every block was held and the per-block loop made hundreds of
+    // thousands of system calls a frame).
+    let held: Vec<usize> = crate::demand::held_between(from * BLOCK, to * BLOCK);
+    if held.is_empty() {
+        protect_range(g, from, to);
+        return;
     }
+    let per_page = crate::demand::page() / BLOCK;
+    let mut held_blocks = 0usize;
+    let mut gap = from;
+    for &page in &held {
+        let b0 = (page * per_page).max(from);
+        let b1 = ((page + 1) * per_page).min(to);
+        held_blocks += b1.saturating_sub(b0);
+        if b0 > gap {
+            protect_range(g, gap, b0);
+        }
+        gap = gap.max(b1);
+    }
+    if gap < to {
+        protect_range(g, gap, to);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::DemandHeldBlocks, held_blocks as u64);
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

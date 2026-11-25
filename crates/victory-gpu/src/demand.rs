@@ -122,6 +122,23 @@ pub(crate) fn yielded(at: usize, generation: u64) {
     }
 }
 
+/// The indices of the demand pages holding a block of `[from, to)` (block
+/// addresses), ascending. Asked by the write watch's `protect_here` to cut
+/// the held pages out as gaps instead of testing every block.
+pub(crate) fn held_between(from: usize, to: usize) -> Vec<usize> {
+    if !enabled() || to <= from {
+        return Vec::new();
+    }
+    let size = page();
+    let first = from / size;
+    let last = to.div_ceil(size);
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = pending.as_ref() else {
+        return Vec::new();
+    };
+    (first..last).filter(|&p| map.contains_key(&p)).collect()
+}
+
 /// An explicit write of `len` bytes at `at` that does not fault (ours
 /// through the kernel, or the title's `fread`): every page of ours under
 /// it is given back and its entry dropped with it. Without this the write
