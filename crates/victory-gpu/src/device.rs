@@ -395,6 +395,38 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             first_points_at = format_args!("{first:x?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
+        // `VICTORY_PSO_SAVE=<dir>`: the description's words name pairs of
+        // (pointer, length) — the title's baked pipeline cache holds its
+        // shaders as blocks inside, and the 16-digit word at offset 88 of
+        // the 0x218 description is the title's own pipeline hash. Each
+        // block is written as `pso/<calls>_<i>_<len>.bin`, with the whole
+        // description beside it, so the blobs can be fed to the recompiler
+        // and the states taken from the paired host pipeline.
+        #[cfg(windows)]
+        if let Some(dir) = std::env::var_os("VICTORY_PSO_SAVE")
+            && calls <= 256
+            && let Some(w) = &description
+        {
+            let dir = std::path::PathBuf::from(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let read = |at: u64, len: u64| -> Option<Vec<u8>> {
+                (at != 0 && len > 0 && len <= (1 << 20)).then(|| {
+                    let mut bytes = vec![0u8; len as usize];
+                    crate::host::read_into(at as *const u8, &mut bytes).then_some(bytes)
+                }).flatten()
+            };
+            for (i, pair) in w[1..].as_chunks::<2>().0.iter().enumerate() {
+                let (at, len) = (pair[0], pair[1]);
+                if let Some(bytes) = read(at, len) {
+                    let _ = std::fs::write(dir.join(format!("{calls}_{i}_{:x}.bin", bytes.len())), &bytes);
+                }
+            }
+            let line = format!("calls {calls} slot {SLOT:#x} words {w:x?}\\n");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("descriptions.txt")) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
     }
     E_NOTIMPL
 }
