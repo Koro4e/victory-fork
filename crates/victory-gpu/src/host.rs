@@ -1931,6 +1931,11 @@ fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
         if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+            if !cfg!(feature = "diagnostics") {
+                tracing::warn!(
+                    "VICTORY_GPU_TIMING does nothing without the diagnostics feature: late wait and the relay stay on"
+                );
+            }
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
