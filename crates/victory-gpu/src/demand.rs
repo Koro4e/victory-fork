@@ -190,6 +190,20 @@ fn hand_back(index: usize) -> bool {
         pending.as_ref().and_then(|m| m.get(&index).copied())
     };
     let Some(end) = was else {
+        // A fault on a page with no pending entry: an ordinary access
+        // violation of the title's (the handler sees them all) — unless
+        // the page is still NOACCESS, which would be a page our guard
+        // left behind without an entry, the crash this file once made
+        // possible. That case is worth a line of its own.
+        #[cfg(feature = "diagnostics")]
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let at = index * page();
+            let n = VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>());
+            if n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS {
+                tracing::warn!(index, "a fault on a page left NOACCESS with no demand entry");
+            }
+        }
         return false;
     };
     let size = page();
