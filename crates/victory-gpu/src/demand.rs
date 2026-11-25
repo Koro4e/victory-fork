@@ -179,12 +179,15 @@ fn guard_page(at: usize, len: usize) -> bool {
 /// out of the copy that holds it and gives the access back. False: the
 /// page is none of ours.
 fn hand_back(index: usize) -> bool {
+    // The entry is taken only after the page's access is back: between the
+    // removal and the protection's return there was a window in which a
+    // second fault on the same page (another of the title's threads, or the
+    // same one re-entering) found no entry and fell through as a crash
+    // nothing of ours explained. Peeking keeps both handlers working on
+    // the same page; the work is the same twice and safe.
     let was = {
-        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        pending
-            .as_mut()
-            .map(|m| m.remove(&index))
-            .unwrap_or(None)
+        let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        pending.as_ref().and_then(|m| m.get(&index).copied())
     };
     let Some(end) = was else {
         return false;
@@ -211,6 +214,12 @@ fn hand_back(index: usize) -> bool {
     let ok = ok != 0;
     if ok {
         FAULTS.fetch_add(1, Ordering::Relaxed);
+        // The entry goes only now: a fault that came in while the page was
+        // still NOACCESS found the entry and did the same work again.
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = pending.as_mut() {
+            m.remove(&index);
+        }
     }
     ok
 }
