@@ -6478,6 +6478,7 @@ impl Meter {
             .map(|(k, n)| format!("{}x{} x{n}", k >> 32, *k as u32))
             .collect::<Vec<_>>()
             .join(", ");
+        let (dscaled, dmixed) = crate::draw::take_dispatch_scales();
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -6564,13 +6565,15 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame \
                  ({replay_same:.0} of them a repeat of the state before, {replay_diff:.0} with another state), \
                  {re_uploads:.0} re-uploads on the second queue, dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms; largest target {tw}x{th} ({sizes}) scaled {tscaled};                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms; largest target {tw}x{th} ({sizes}) scaled {tscaled}; dispatches shrunk {dscaled:.0}, left full-size with a scaled target {dmixed:.0};                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 tw = tw,
                 th = th,
                 tscaled = crate::resource::TARGET_SCALED.swap(0, std::sync::atomic::Ordering::Relaxed),
+                dscaled = dscaled,
+                dmixed = dmixed,
                 sizes = sizes,
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

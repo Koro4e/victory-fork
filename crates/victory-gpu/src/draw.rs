@@ -241,12 +241,30 @@ pub(crate) struct State {
     /// (slice 1 of `VICTORY_FRAME_REPLAY`: 0 until the first one).
     last_key: u64,
     /// The scale of the scaled UAV textures the list's tables hold: the
-    /// smallest seen since the last draw or dispatch (0: none). A dispatch
-    /// writing through a scaled target asks for the title's full-size
-    /// groups; the host texture is smaller by this, so its groups shrink
-    /// to match ([`State::dispatch`]). Reset by every draw, so a stale
-    /// scale cannot reach a dispatch whose targets are full-size.
+    /// smallest and the biggest seen since the last draw or dispatch
+    /// (0: none). A dispatch writing through scaled targets asks for the
+    /// title's full-size groups; the host textures are smaller, so its
+    /// groups shrink to match ([`State::dispatch`]). The groups shrink
+    /// only when every texture UAV the tables hold is scaled: a pass that
+    /// also writes a full-size one (a velocity buffer next to the scaled
+    /// scene, say) needs its full-size groups. Reset by every draw, so a
+    /// stale scale cannot reach a dispatch whose targets are full-size.
     dispatch_scale: std::cell::Cell<u32>,
+    dispatch_scale_max: std::cell::Cell<u32>,
+}
+
+/// Dispatches whose groups were shrunk to a scaled target, and those seen
+/// with a scaled target among their UAVs but left full-size (a full-size
+/// target among them): the frame line shows both, so a pass the heuristic
+/// missed (the quarter-screen kind) names itself.
+static DISPATCH_SCALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DISPATCH_MIXED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn take_dispatch_scales() -> (u64, u64) {
+    (
+        DISPATCH_SCALED.swap(0, Ordering::Relaxed),
+        DISPATCH_MIXED.swap(0, Ordering::Relaxed),
+    )
 }
 
 impl Drop for State {
@@ -2211,6 +2229,7 @@ impl State {
         }
         let s = crate::resource::host_scale(*r as crate::object::This);
         if s >= 1.0 {
+            self.dispatch_scale_max.set(1.0f32.to_bits());
             return;
         }
         let bits = self.dispatch_scale.get();
@@ -2277,16 +2296,23 @@ impl State {
         // A dispatch whose tables hold a scaled target wrote the title's
         // full-size groups: the host texture is smaller, so its groups
         // shrink to match, and the shader's thread coordinates land in it
-        // ([`State::dispatch_scale`]). The scale resets: the next dispatch
+        // ([`State::dispatch_scale`]) — but only when every texture UAV
+        // the tables hold is scaled; one full-size target among them
+        // needs the full-size groups. The scale resets: the next dispatch
         // measures its own targets.
         let bits = self.dispatch_scale.replace(0);
-        let (x, y) = if bits != 0 {
+        let top = self.dispatch_scale_max.replace(0);
+        let (x, y) = if bits != 0 && top == 0 {
+            DISPATCH_SCALED.fetch_add(1, Ordering::Relaxed);
             let s = f32::from_bits(bits);
             (
                 ((x as f32) * s).ceil().max(1.0) as u32,
                 ((y as f32) * s).ceil().max(1.0) as u32,
             )
         } else {
+            if bits != 0 {
+                DISPATCH_MIXED.fetch_add(1, Ordering::Relaxed);
+            }
             (x, y)
         };
         // SAFETY: an open list with everything set.
@@ -2945,6 +2971,7 @@ impl State {
     ) {
         self.window = None;
         self.dispatch_scale.set(0);
+        self.dispatch_scale_max.set(0);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3060,6 +3087,7 @@ impl State {
     ) {
         self.window = None;
         self.dispatch_scale.set(0);
+        self.dispatch_scale_max.set(0);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
