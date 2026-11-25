@@ -2312,14 +2312,20 @@ impl State {
         } else {
             if bits != 0 {
                 // A pass with both a scaled and a full-size target: left
-                // full-size on purpose. Named once, so a pass this rule
-                // wrongly holds back (the quarter-screen kind) gives its
-                // pipeline's name.
-                once!(
-                    pipeline = format_args!("{}", p.name),
-                    groups = format_args!("{x}x{y}x{z}"),
-                    "a dispatch left full-size: a scaled target and a full-size one among its UAVs"
-                );
+                // full-size on purpose. Each distinct pipeline names itself
+                // once, so the ones this rule wrongly holds back (the
+                // quarter-screen kind) give their names.
+                static NAMED: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+                    std::sync::Mutex::new(None);
+                let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+                let named = named.get_or_insert_with(std::collections::HashSet::new);
+                if named.len() < 40 && named.insert(self.pipeline as usize as u64) {
+                    once!(
+                        pipeline = format_args!("{}", p.name),
+                        groups = format_args!("{x}x{y}x{z}"),
+                        "a dispatch left full-size: a scaled target and a full-size one among its UAVs"
+                    );
+                }
                 DISPATCH_MIXED.fetch_add(1, Ordering::Relaxed);
             }
             (x, y)
