@@ -2584,6 +2584,8 @@ impl Shadow {
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         if !crate::demand::offer(self, at, n, &title) {
             crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SelfWritten, n as u64);
         }
         n
     }
@@ -2599,6 +2601,8 @@ impl Shadow {
         // SAFETY: inside the copy's mapping (checked above), and the title
         // memory it lands in is committed (it was guarded there).
         unsafe { crate::host::write_mapped((start + at) as *mut u8, self.data.add(at), n) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SelfWritten, n as u64);
         crate::watch::writing(start + at, n);
     }
 
