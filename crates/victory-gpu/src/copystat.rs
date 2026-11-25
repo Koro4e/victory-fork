@@ -36,6 +36,11 @@ pub(crate) enum C {
     /// Bytes of watched ranges checked, and of those found unchanged.
     Checked,
     Unchanged,
+    /// Bytes we ourselves wrote into title memory (copy steps, the demand
+    /// back, relay merges): the writes that follow them can only find the
+    /// bytes we put there, so a large share of `Checked` equal to this is
+    /// comparisons our own writes caused.
+    SelfWritten,
     /// Copies that met an unmapped page.
     Fallbacks,
     /// Writes taken by the guard on view memory.
